@@ -1,65 +1,79 @@
-import * as dnsPacket from 'dns-packet'
-import { Buffer } from 'buffer'
-
-const DOH_ADDRESS = "cloudflare-dns.com/dns-query"
-
 export default {
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url)
-    const { pathname, search } = url
+  async fetch(request: Request, env: any, ctx: any): Promise<Response> {
+    return handle(request, ctx);
+  }
+};
 
-    if (pathname == "/") {
-      return new Response(`200 OK`, { status: 200 })
+const UPSTREAM = "https://security.cloudflare-dns.com/dns-query";
+const CT = "application/dns-message";
+const CACHE_TTL = 300;
+
+async function handle(request: Request, ctx: any): Promise<Response> {
+
+  const url = new URL(request.url);
+
+  if (!(url.pathname === "/" || url.pathname === "/dns-query")) {
+    return new Response("Not Found", { status: 404 });
+  }
+
+  const clientIP =
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("x-forwarded-for");
+
+  // GET (cacheable)
+  if (request.method === "GET") {
+
+    const cache = caches.default;
+    const cacheKey = request;
+
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+
+    const upstreamResp = await fetch(UPSTREAM + url.search, {
+      headers: { Accept: CT },
+      cf: {
+        cacheEverything: true,
+        cacheTtl: CACHE_TTL,
+      },
+      keepalive: true,
+    });
+
+    const resp = new Response(upstreamResp.body, upstreamResp);
+
+    resp.headers.set("Cache-Control", `public, max-age=${CACHE_TTL}`);
+    resp.headers.set("Access-Control-Allow-Origin", "*");
+
+    ctx.waitUntil(cache.put(cacheKey, resp.clone()));
+
+    return resp;
+  }
+
+  // POST (used by kdig)
+  if (request.method === "POST") {
+
+    const body = await request.arrayBuffer();
+
+    const headers: Record<string, string> = {
+      "Content-Type": CT,
+      "Accept": CT,
+    };
+
+    if (clientIP) {
+      headers["CF-Connecting-IP"] = clientIP;
+      headers["X-Forwarded-For"] = clientIP;
     }
 
-    if (request.method !== "GET" && request.method !== "POST") {
-      return new Response(`Method ${request.method} not allowed.`, { status: 405 })
-    }
+    return fetch(UPSTREAM, {
+      method: "POST",
+      headers,
+      body,
+      cf: {
+        cacheEverything: true,
+        cacheTtl: CACHE_TTL,
+      },
+      keepalive: true,
+    });
+  }
 
-    // Get the client's IP address from the request headers
-    const clientIp = request.headers.get('CF-Connecting-IP')
-
-    if (!clientIp) {
-      throw new Error('Client IP not found in request headers')
-    }
-
-    // Determine the source prefix length based on the IP address type
-    const sourcePrefixLength = clientIp.includes(':') ? 48 : 24
-
-    // Parse the DNS packet from the request body
-    const body = await request.clone().arrayBuffer()
-    const dnsMsg = dnsPacket.decode(Buffer.from(body))
-
-    // Create an EDNS Client Subnet option
-    const ecsOption = {
-      code: 'CLIENT_SUBNET',
-      ip: clientIp,
-      sourcePrefixLength: sourcePrefixLength,
-      scopePrefixLength: 0
-    }
-
-    // Add the EDNS option to the DNS packet
-    dnsMsg.additionals.push({
-      type: 'OPT',
-      name: '.',
-      udpPayloadSize: 4096,
-      options: [ecsOption]
-    })
-
-    // Enable DNSSEC by setting the DO flag
-    dnsMsg.flags |= (1 << 15)
-
-    // Encode the modified DNS packet back into the request body
-    const modifiedBody = dnsPacket.encode(dnsMsg)
-
-    const newURL = `https://${DOH_ADDRESS}`
-    const newRequest = new Request(newURL, {
-      body: modifiedBody,
-      headers: request.headers,
-      method: request.method,
-      redirect: request.redirect
-    })
-
-    return await fetch(newRequest)
-  },
+  return new Response("Method Not Allowed", { status: 405 });
 }
